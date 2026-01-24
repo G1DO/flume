@@ -6,19 +6,24 @@ import (
 	"os"
 	"path/filepath"
 )
+type ConfigSegment struct{
+	SyncWrites int
+}
 
 // Segment represents a single log segment file.
 // Records are appended sequentially and read by offset.
 type Segment struct {
-	file       *os.File
-	baseOffset int64  // first offset in this segment
-	nextOffset int64  // next offset to assign
-	path       string // file path for reopening
+	file            *os.File
+	baseOffset      int64  // first offset in this segment
+	nextOffset      int64  // next offset to assign
+	path            string // file path for reopening
+	config          ConfigSegment
+	writesSinceSync int // counter (resets after sync)
 }
 
 // NewSegment creates or opens a segment file.
 // baseOffset is the starting offset for records in this segment.
-func NewSegment(dir string, baseOffset int64) (*Segment, error) {
+func NewSegment(dir string, baseOffset int64, config ConfigSegment) (*Segment, error) {
 	// Create directory if it doesn't exist
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, err
@@ -39,6 +44,7 @@ func NewSegment(dir string, baseOffset int64) (*Segment, error) {
 		baseOffset: baseOffset,
 		nextOffset: baseOffset, // will be updated during recovery
 		path:       path,
+		config:     config,
 	}, nil
 }
 
@@ -57,6 +63,15 @@ func (s *Segment) Append(record *Record) (int64, error) {
 	// Increment offset for next record
 	offset := s.nextOffset
 	s.nextOffset++
+
+	// Fsync based on config
+	s.writesSinceSync++
+	if s.config.SyncWrites > 0 && s.writesSinceSync >= s.config.SyncWrites {
+		if err := s.file.Sync(); err != nil {
+			return 0, fmt.Errorf("sync failed: %w", err)
+		}
+		s.writesSinceSync = 0
+	}
 
 	return offset, nil
 }
