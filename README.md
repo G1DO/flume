@@ -22,9 +22,9 @@ A message streaming system built from scratch in Go. Not a Kafka wrapper — the
 | Record format + serialization (CRC32) | Done |
 | Segment Append() | Done |
 | Segment Recover() | Done |
-| Segment Read() | Not started |
-| Fsync strategy | Not started |
-| Sparse index for offset lookup | Not started |
+| Segment Read() | Done |
+| Fsync strategy (configurable) | Done |
+| Sparse index for offset lookup | Done |
 | Multi-segment with rollover | Not started |
 
 ## What This Is
@@ -83,9 +83,11 @@ flume/
 ├── internal/
 │   ├── storage/          # Phase 1: Log engine
 │   │   ├── record.go     # Record struct, encode/decode, CRC, stream reading
-│   │   ├── record_test.go # Unit tests for record operations
-│   │   ├── segment.go    # Single segment file with Append() and Recover()
-│   │   └── errors.go     # Storage error types
+│   │   ├── segment.go    # Segment file with Append(), Read(), Recover(), configurable fsync
+│   │   ├── index.go      # Sparse offset index for fast lookups
+│   │   ├── log.go        # Multi-segment log abstraction
+│   │   ├── errors.go     # Storage error types
+│   │   └── *_test.go     # Unit tests
 │   ├── protocol/         # (planned) Wire protocol
 │   ├── broker/           # (planned) TCP server
 │   ├── topic/            # (planned) Topics + partitions
@@ -136,11 +138,21 @@ size := record.TotalSize()
 ### Segment
 
 ```go
+// Configure segment behavior
+config := storage.ConfigSegment{
+    SyncWrites:    100,  // fsync after every 100 writes (0 = never)
+    IndexInterval: 4096, // add index entry every 4096 bytes
+}
+
 // Create or open a segment file
-segment, err := storage.NewSegment("/path/to/data", baseOffset)
+segment, err := storage.NewSegment("/path/to/data", baseOffset, config)
 
 // Append a record (returns assigned offset)
+// Automatically fsyncs based on SyncWrites config
 offset, err := segment.Append(record)
+
+// Read a record by offset (uses sparse index for fast lookup)
+record, err := segment.Read(offset)
 
 // Recover state after restart (scans file, updates nextOffset)
 err := segment.Recover()
@@ -164,6 +176,8 @@ Benchmarks will be added after Phase 6.
 - **Naming convention**: 20-digit zero-padded offset (e.g., `00000000000000000000.log`) for lexicographic sorting
 - **Append-only**: Records written sequentially, never modified in place
 - **Recovery**: On restart, Recover() scans the segment sequentially to rebuild nextOffset state
+- **Configurable fsync**: `SyncWrites` controls durability/performance tradeoff (0 = OS-managed, N = sync every N writes)
+- **Sparse index**: Index entries added at configurable byte intervals for O(1) seek + short scan reads
 
 ## What I Learned
 
