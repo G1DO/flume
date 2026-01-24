@@ -2,6 +2,7 @@ package storage
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 )
@@ -69,4 +70,39 @@ func (s *Segment) Close() error {
 // Example: 0 → "00000000000000000000"
 func formatOffset(offset int64) string {
 	return fmt.Sprintf("%020d", offset)
+}
+
+
+func (s *Segment) Recover() error {
+    // 1. Seek to start of file
+    	_, err := s.file.Seek(0, io.SeekStart)
+if err != nil {
+    return fmt.Errorf("seek failed: %w", err)
+}
+    // 2. Loop: decode records until EOF
+    //    - track the last offset seen
+	lastOffset :=s.baseOffset-1
+    for {
+		record, err := ReadRecord(s.file)
+if err == io.EOF {
+    break
+}
+if err != nil {
+ return fmt.Errorf("decode failed: %w", err)
+
+    
+}
+    // 3. Update s.nextOffset
+    //    - if empty: stays at baseOffset
+    //    - if records found: lastOffset + 1
+         lastOffset = record.Offset
+   
+ 
+
+
+}
+s.nextOffset = lastOffset + 1
+		 return nil
+    
+
 }

@@ -3,6 +3,7 @@ package storage
 import (
 	"encoding/binary"
 	"hash/crc32"
+	"io"
 )
 
 const (
@@ -72,6 +73,36 @@ func DecodeRecord(data []byte) (*Record, error) {
 // ValidateCRC checks if the payload matches the stored CRC.
 func (r *Record) ValidateCRC() bool {
 	return crc32.ChecksumIEEE(r.Payload) == r.CRC
+}
+
+// ReadRecord reads a single record from a stream.
+// Returns io.EOF when no more records.
+func ReadRecord(r io.Reader) (*Record, error) {
+	// Read header (16 bytes)
+	header := make([]byte, HeaderSize)
+	_, err := io.ReadFull(r, header)
+	if err != nil {
+		return nil, err // includes io.EOF
+	}
+
+	// Parse header
+	offset := int64(binary.BigEndian.Uint64(header[0:8]))
+	size := int32(binary.BigEndian.Uint32(header[8:12]))
+	crc := binary.BigEndian.Uint32(header[12:16])
+
+	// Read payload
+	payload := make([]byte, size)
+	_, err = io.ReadFull(r, payload)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Record{
+		Offset:  offset,
+		Size:    size,
+		CRC:     crc,
+		Payload: payload,
+	}, nil
 }
 
 // TotalSize returns the total bytes this record takes on disk.

@@ -4,15 +4,28 @@ A message streaming system built from scratch in Go. Not a Kafka wrapper — the
 
 ## Status
 
-🚧 **In Development**
+**In Development** — Phase 1 (Log Storage Engine)
 
 | Phase | Description | Status |
 |-------|-------------|--------|
-| 1 | Single-topic broker | Not started |
-| 2 | Multi-topic + partitions | Not started |
-| 3 | Consumer groups | Not started |
-| 4 | Backpressure | Not started |
-| 5 | Benchmarks | Not started |
+| 1 | Log Storage Engine | In Progress |
+| 2 | Broker + Wire Protocol | Not started |
+| 3 | Topics + Partitions | Not started |
+| 4 | Consumer Groups | Not started |
+| 5 | Backpressure | Not started |
+| 6 | Integration + Benchmarks | Not started |
+
+### Phase 1 Progress
+
+| Milestone | Status |
+|-----------|--------|
+| Record format + serialization (CRC32) | Done |
+| Segment Append() | Done |
+| Segment Recover() | Done |
+| Segment Read() | Not started |
+| Fsync strategy | Not started |
+| Sparse index for offset lookup | Not started |
+| Multi-segment with rollover | Not started |
 
 ## What This Is
 
@@ -32,40 +45,126 @@ A learning project that implements:
 ## Architecture
 
 ```
-Producers → Broker → Consumers
-              │
-         ┌────┴────┐
-         │  Topics │
-         │ ┌─────┐ │
-         │ │ P0  │ │  ← Partitions (separate log files)
-         │ │ P1  │ │
-         │ │ P2  │ │
-         │ └─────┘ │
-         └─────────┘
+Producers --> Broker --> Consumers
+                |
+           +----+----+
+           |  Topics |
+           | +-----+ |
+           | | P0  | |  <-- Partitions (separate log files)
+           | | P1  | |
+           | | P2  | |
+           | +-----+ |
+           +---------+
 ```
 
-<!-- TODO: expand after Phase 1 complete -->
+### Record Format (Implemented)
+
+```
++----------+----------+----------+-------------------+
+| Offset   | Size     | CRC32    | Payload           |
+| 8 bytes  | 4 bytes  | 4 bytes  | variable          |
++----------+----------+----------+-------------------+
+           |<-- 16-byte header -->|
+```
+
+- **Offset**: 64-bit record position in log
+- **Size**: 32-bit payload length
+- **CRC32**: IEEE checksum for corruption detection
+- **Payload**: Raw message bytes
+
+## Project Structure
+
+```
+flume/
+├── cmd/
+│   ├── broker/           # (planned) Main broker binary
+│   ├── produce/          # (planned) CLI producer
+│   └── consume/          # (planned) CLI consumer
+├── internal/
+│   ├── storage/          # Phase 1: Log engine
+│   │   ├── record.go     # Record struct, encode/decode, CRC, stream reading
+│   │   ├── record_test.go # Unit tests for record operations
+│   │   ├── segment.go    # Single segment file with Append() and Recover()
+│   │   └── errors.go     # Storage error types
+│   ├── protocol/         # (planned) Wire protocol
+│   ├── broker/           # (planned) TCP server
+│   ├── topic/            # (planned) Topics + partitions
+│   └── consumer/         # (planned) Consumer groups
+├── pkg/
+│   └── client/           # (planned) Producer/consumer libraries
+├── test/
+│   └── integration/      # (planned) End-to-end tests
+└── docs/
+    └── BUILD_PLAN.md     # Detailed phase roadmap
+```
 
 ## Usage
 
 ```bash
-# TODO: add commands after implementation
+# Run tests
+go test ./...
+```
+
+CLI tools not yet implemented — see BUILD_PLAN.md for roadmap.
+
+## Current API (internal/storage)
+
+### Record
+
+```go
+// Create a new record with payload
+record := storage.NewRecord([]byte("message"))
+
+// Encode to bytes for disk storage
+data := record.Encode()
+
+// Decode from bytes
+decoded, err := storage.DecodeRecord(data)
+
+// Read from an io.Reader stream (returns io.EOF at end)
+record, err := storage.ReadRecord(reader)
+
+// Validate integrity
+if !record.ValidateCRC() {
+    // record is corrupted
+}
+
+// Get total bytes on disk (header + payload)
+size := record.TotalSize()
+```
+
+### Segment
+
+```go
+// Create or open a segment file
+segment, err := storage.NewSegment("/path/to/data", baseOffset)
+
+// Append a record (returns assigned offset)
+offset, err := segment.Append(record)
+
+// Recover state after restart (scans file, updates nextOffset)
+err := segment.Recover()
+
+// Close the segment file
+err := segment.Close()
 ```
 
 ## Benchmarks
 
-<!-- TODO: fill after Phase 5 -->
-
-| Metric | Value |
-|--------|-------|
-| Throughput | TBD |
-| p99 Latency | TBD |
-| Recovery time (1M msgs) | TBD |
+Benchmarks will be added after Phase 6.
 
 ## Design Decisions
 
-<!-- Document trade-offs as you build -->
+### Record Format
+- **Big-endian encoding**: Network byte order for potential future cross-platform compatibility
+- **CRC32-IEEE**: Standard checksum algorithm, fast and sufficient for corruption detection
+- **Fixed 16-byte header**: Predictable layout simplifies parsing; offset stored per-record enables segment-level recovery
+
+### Segment Files
+- **Naming convention**: 20-digit zero-padded offset (e.g., `00000000000000000000.log`) for lexicographic sorting
+- **Append-only**: Records written sequentially, never modified in place
+- **Recovery**: On restart, Recover() scans the segment sequentially to rebuild nextOffset state
 
 ## What I Learned
 
-<!-- Add insights after each phase -->
+*Notes added after each phase completion.*
