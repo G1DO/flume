@@ -106,3 +106,28 @@ s.nextOffset = lastOffset + 1
     
 
 }
+
+func (s *Segment) Read(offset int64) (*Record, error) {
+	// Check if offset could be in this segment
+	if offset < s.baseOffset {
+		return nil, fmt.Errorf("offset %d is below segment base %d", offset, s.baseOffset)
+	}
+//point on first of the file
+	_, err := s.file.Seek(0, io.SeekStart)
+	if err != nil {
+		return nil, fmt.Errorf("seek failed: %w", err)
+	}
+
+	for {
+		record, err := ReadRecord(s.file)
+		if err == io.EOF {
+			return nil, fmt.Errorf("offset %d not found", offset)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read failed: %w", err)
+		}
+		if record.Offset == offset {
+			return record, nil
+		}
+	}
+}
