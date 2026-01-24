@@ -6,8 +6,9 @@ import (
 	"os"
 	"path/filepath"
 )
-type ConfigSegment struct{
-	SyncWrites int
+type ConfigSegment struct {
+	SyncWrites    int   // fsync after N writes (0 = never)
+	IndexInterval int64 // add index entry every N bytes (default 4096)
 }
 
 // Segment represents a single log segment file.
@@ -18,7 +19,9 @@ type Segment struct {
 	nextOffset      int64  // next offset to assign
 	path            string // file path for reopening
 	config          ConfigSegment
-	writesSinceSync int // counter (resets after sync)
+	writesSinceSync int    // counter (resets after sync)
+	index           *Index // sparse index for fast lookups
+	currentPos      int64  // current write position in file
 }
 
 // NewSegment creates or opens a segment file.
@@ -39,12 +42,22 @@ func NewSegment(dir string, baseOffset int64, config ConfigSegment) (*Segment, e
 		return nil, err
 	}
 
+	// Create index with matching base offset
+	indexConfig := IndexConfig{ByteInterval: config.IndexInterval}
+	index, err := NewIndex(dir, baseOffset, indexConfig)
+	if err != nil {
+		file.Close()
+		return nil, err
+	}
+
 	return &Segment{
 		file:       file,
 		baseOffset: baseOffset,
 		nextOffset: baseOffset, // will be updated during recovery
 		path:       path,
 		config:     config,
+		index:      index,
+		currentPos: 0, // will be updated during recovery
 	}, nil
 }
 
@@ -53,11 +66,23 @@ func (s *Segment) Append(record *Record) (int64, error) {
 	// Assign offset to record
 	record.Offset = s.nextOffset
 
+	// Remember position before write (for index)
+	position := s.currentPos
+
 	// Encode and write
 	data := record.Encode()
 	_, err := s.file.Write(data)
 	if err != nil {
 		return 0, err
+	}
+
+	// Update position tracker
+	recordSize := len(data)
+	s.currentPos += int64(recordSize)
+
+	// Maybe add index entry
+	if _, err := s.index.MaybeAdd(record.Offset, position, recordSize); err != nil {
+		return 0, fmt.Errorf("index update failed: %w", err)
 	}
 
 	// Increment offset for next record
@@ -76,8 +101,12 @@ func (s *Segment) Append(record *Record) (int64, error) {
 	return offset, nil
 }
 
-// Close closes the segment file.
+// Close closes the segment and its index.
 func (s *Segment) Close() error {
+	// Close index first
+	if err := s.index.Close(); err != nil {
+		return err
+	}
 	return s.file.Close()
 }
 
@@ -89,37 +118,37 @@ func formatOffset(offset int64) string {
 
 
 func (s *Segment) Recover() error {
-    // 1. Seek to start of file
-    	_, err := s.file.Seek(0, io.SeekStart)
-if err != nil {
-    return fmt.Errorf("seek failed: %w", err)
-}
-    // 2. Loop: decode records until EOF
-    //    - track the last offset seen
-	lastOffset :=s.baseOffset-1
-    for {
+	// Recover index entries from disk
+	if err := s.index.Recover(); err != nil {
+		return fmt.Errorf("index recovery failed: %w", err)
+	}
+
+	// Seek to start of log file
+	_, err := s.file.Seek(0, io.SeekStart)
+	if err != nil {
+		return fmt.Errorf("seek failed: %w", err)
+	}
+
+	// Scan all records to find last offset and current position
+	lastOffset := s.baseOffset - 1
+	var totalBytes int64 = 0
+
+	for {
 		record, err := ReadRecord(s.file)
-if err == io.EOF {
-    break
-}
-if err != nil {
- return fmt.Errorf("decode failed: %w", err)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("decode failed: %w", err)
+		}
 
-    
-}
-    // 3. Update s.nextOffset
-    //    - if empty: stays at baseOffset
-    //    - if records found: lastOffset + 1
-         lastOffset = record.Offset
-   
- 
+		lastOffset = record.Offset
+		totalBytes += int64(record.TotalSize())
+	}
 
-
-}
-s.nextOffset = lastOffset + 1
-		 return nil
-    
-
+	s.nextOffset = lastOffset + 1
+	s.currentPos = totalBytes
+	return nil
 }
 
 func (s *Segment) Read(offset int64) (*Record, error) {
@@ -127,12 +156,20 @@ func (s *Segment) Read(offset int64) (*Record, error) {
 	if offset < s.baseOffset {
 		return nil, fmt.Errorf("offset %d is below segment base %d", offset, s.baseOffset)
 	}
-//point on first of the file
-	_, err := s.file.Seek(0, io.SeekStart)
+
+	// Use index to find starting position (instead of scanning from 0)
+	startPos := int64(0)
+	if pos, found := s.index.Find(offset); found {
+		startPos = pos
+	}
+
+	// Seek to the position from index
+	_, err := s.file.Seek(startPos, io.SeekStart)
 	if err != nil {
 		return nil, fmt.Errorf("seek failed: %w", err)
 	}
 
+	// Scan forward until we find the target offset
 	for {
 		record, err := ReadRecord(s.file)
 		if err == io.EOF {
