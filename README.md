@@ -4,28 +4,30 @@ A message streaming system built from scratch in Go. Not a Kafka wrapper — the
 
 ## Status
 
-**In Development** — Phase 1 (Log Storage Engine)
+**In Development** — Phase 2 (Broker + Wire Protocol)
 
 | Phase | Description | Status |
 |-------|-------------|--------|
-| 1 | Log Storage Engine | In Progress |
-| 2 | Broker + Wire Protocol | Not started |
+| 1 | Log Storage Engine | Complete |
+| 2 | Broker + Wire Protocol | In Progress |
 | 3 | Topics + Partitions | Not started |
 | 4 | Consumer Groups | Not started |
 | 5 | Backpressure | Not started |
 | 6 | Integration + Benchmarks | Not started |
 
-### Phase 1 Progress
+### Phase 2 Progress
 
 | Milestone | Status |
 |-----------|--------|
-| Record format + serialization (CRC32) | Done |
-| Segment Append() | Done |
-| Segment Recover() | Done |
-| Segment Read() | Done |
-| Fsync strategy (configurable) | Done |
-| Sparse index for offset lookup | Done |
-| Multi-segment with rollover | Not started |
+| Wire protocol types (Request/Response headers) | Done |
+| ProduceRequest/ProduceResponse encoding | Done |
+| FetchRequest/FetchResponse encoding | Done |
+| Error codes | Done |
+| TCP server | Not started |
+| PRODUCE handler | Not started |
+| FETCH handler | Not started |
+| Producer client | Not started |
+| Consumer client | Not started |
 
 ## What This Is
 
@@ -88,7 +90,10 @@ flume/
 │   │   ├── log.go        # Multi-segment log abstraction
 │   │   ├── errors.go     # Storage error types
 │   │   └── *_test.go     # Unit tests
-│   ├── protocol/         # (planned) Wire protocol
+│   ├── protocol/         # Phase 2: Wire protocol (in progress)
+│   │   ├── types.go      # Request/response structs, API keys, error codes
+│   │   ├── encode.go     # Binary encode/decode for all message types
+│   │   └── *_test.go     # Round-trip and edge case tests
 │   ├── broker/           # (planned) TCP server
 │   ├── topic/            # (planned) Topics + partitions
 │   └── consumer/         # (planned) Consumer groups
@@ -161,6 +166,61 @@ err := segment.Recover()
 err := segment.Close()
 ```
 
+### Protocol (internal/protocol)
+
+```go
+// API keys identify the operation
+const (
+    APIKeyProduce int16 = 0
+    APIKeyFetch   int16 = 1
+)
+
+// Error codes
+const (
+    ErrNone             int16 = 0
+    ErrUnknown          int16 = 1
+    ErrTopicNotFound    int16 = 2
+    ErrOffsetOutOfRange int16 = 3
+)
+
+// Encode/decode request headers
+header := &protocol.RequestHeader{
+    Size:      100,
+    APIKey:    protocol.APIKeyProduce,
+    RequestID: 42,
+}
+data := protocol.EncodeRequestHeader(header)
+decoded, err := protocol.DecodeRequestHeader(reader)
+
+// Encode/decode produce requests
+req := &protocol.ProduceRequest{
+    Topic:   "orders",
+    Payload: []byte(`{"user": 123}`),
+}
+data := protocol.EncodeProduceRequest(req)
+decoded, err := protocol.DecodeProduceRequest(data)
+
+// Encode/decode fetch requests
+fetchReq := &protocol.FetchRequest{
+    Topic:    "orders",
+    Offset:   0,
+    MaxBytes: 65536,
+}
+data := protocol.EncodeFetchRequest(fetchReq)
+decoded, err := protocol.DecodeFetchRequest(data)
+
+// Encode/decode fetch responses (with multiple records)
+resp := &protocol.FetchResponse{
+    ErrorCode: protocol.ErrNone,
+    Records: []protocol.FetchRecord{
+        {Offset: 0, Payload: []byte("first")},
+        {Offset: 1, Payload: []byte("second")},
+    },
+}
+data := protocol.EncodeFetchResponse(resp)
+decoded, err := protocol.DecodeFetchResponse(data)
+```
+
 ## Benchmarks
 
 Benchmarks will be added after Phase 6.
@@ -178,6 +238,24 @@ Benchmarks will be added after Phase 6.
 - **Recovery**: On restart, Recover() scans the segment sequentially to rebuild nextOffset state
 - **Configurable fsync**: `SyncWrites` controls durability/performance tradeoff (0 = OS-managed, N = sync every N writes)
 - **Sparse index**: Index entries added at configurable byte intervals for O(1) seek + short scan reads
+
+### Wire Protocol
+- **Big-endian encoding**: Network byte order, consistent with storage layer
+- **Length-prefixed messages**: Size field first enables framing on TCP stream
+- **Request correlation**: RequestID echoed in response for async request matching
+- **Separate header/payload encoding**: Headers decoded first to route to correct handler
+
+```
+Request:  [Size:4][APIKey:2][RequestID:4][Payload:var]
+Response: [Size:4][RequestID:4][Payload:var]
+
+ProduceRequest:  [TopicLen:2][Topic:var][PayloadLen:4][Payload:var]
+ProduceResponse: [Offset:8][ErrorCode:2]
+
+FetchRequest:    [TopicLen:2][Topic:var][Offset:8][MaxBytes:4]
+FetchResponse:   [ErrorCode:2][RecordCount:4][Records:var]
+  Each record:   [Offset:8][PayloadLen:4][Payload:var]
+```
 
 ## What I Learned
 
