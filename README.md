@@ -4,13 +4,13 @@ A message streaming system built from scratch in Go. Not a Kafka wrapper — the
 
 ## Status
 
-**In Development** — Phase 3 (Topics + Partitions)
+**In Development** — Phase 4 (Consumer Groups)
 
 | Phase | Description | Status |
 |-------|-------------|--------|
 | 1 | Log Storage Engine | Complete |
 | 2 | Broker + Wire Protocol | Complete |
-| 3 | Topics + Partitions | Not started |
+| 3 | Topics + Partitions | Complete |
 | 4 | Consumer Groups | Not started |
 | 5 | Backpressure | Not started |
 | 6 | Integration + Benchmarks | Not started |
@@ -87,12 +87,16 @@ flume/
 │   │   ├── server.go     # TCP listener, connection handling, topic log management
 │   │   ├── handlers.go   # PRODUCE and FETCH request handlers
 │   │   └── *_test.go     # Integration tests
-│   ├── topic/            # (planned) Topics + partitions
+│   ├── topic/            # Phase 3: Topics + partitions
+│   │   ├── partition.go  # Partition wrapping Log
+│   │   ├── topic.go      # Topic with multiple partitions
+│   │   └── manager.go    # Topic registry with lazy creation
 │   └── consumer/         # (planned) Consumer groups
 ├── pkg/
-│   └── client/           # Phase 2: Client libraries
-│       ├── producer.go   # Producer with connection pooling
-│       └── consumer.go   # Consumer with offset tracking
+│   └── client/           # Client libraries
+│       ├── producer.go   # Producer with key-based partitioning
+│       ├── consumer.go   # Consumer with partition + offset tracking
+│       └── partitioner.go # Key -> partition routing (FNV-1a hash)
 ├── test/
 │   └── integration/      # (planned) End-to-end tests
 └── docs/
@@ -108,11 +112,14 @@ go test ./...
 # Start the broker (default port 9092, data in ./data)
 go run ./cmd/broker --port 9092 --data ./data
 
-# Produce a message
+# Produce a message (goes to partition 0 by default)
 go run ./cmd/produce --broker localhost:9092 --topic test --message "hello world"
 
-# Consume messages from offset 0
-go run ./cmd/consume --broker localhost:9092 --topic test --offset 0
+# Produce with a key (same key = same partition)
+go run ./cmd/produce --broker localhost:9092 --topic test --key user-123 --message "event1"
+
+# Consume from a specific partition and offset
+go run ./cmd/consume --broker localhost:9092 --topic test --partition 0 --offset 0
 
 # Build all binaries
 go build ./cmd/broker
@@ -123,21 +130,29 @@ go build ./cmd/consume
 ### Example Session
 
 ```bash
-# Terminal 1: Start broker
+# Terminal 1: Start broker (default 3 partitions per topic)
 ./broker --port 9092 &
 
-# Terminal 2: Produce messages
-./produce --topic orders --message '{"user": 123, "item": "widget"}'
-# Output: Produced to orders at offset 0
+# Terminal 2: Produce messages with keys (same key = same partition)
+./produce --topic orders --key user-123 --message '{"item": "widget"}'
+# Output: Produced to orders partition 1 at offset 0
 
-./produce --topic orders --message '{"user": 456, "item": "gadget"}'
-# Output: Produced to orders at offset 1
+./produce --topic orders --key user-123 --message '{"item": "gadget"}'
+# Output: Produced to orders partition 1 at offset 1
 
-# Terminal 3: Consume messages
-./consume --topic orders --offset 0
+./produce --topic orders --key user-456 --message '{"item": "thing"}'
+# Output: Produced to orders partition 2 at offset 0
+
+# Terminal 3: Consume from partition 1
+./consume --topic orders --partition 1 --offset 0
 # Output:
-# [0] {"user": 123, "item": "widget"}
-# [1] {"user": 456, "item": "gadget"}
+# [0] {"item": "widget"}
+# [1] {"item": "gadget"}
+
+# Consume from partition 2
+./consume --topic orders --partition 2 --offset 0
+# Output:
+# [0] {"item": "thing"}
 ```
 
 ## Current API (internal/storage)
@@ -218,19 +233,22 @@ header := &protocol.RequestHeader{
 data := protocol.EncodeRequestHeader(header)
 decoded, err := protocol.DecodeRequestHeader(reader)
 
-// Encode/decode produce requests
+// Encode/decode produce requests (with partition and key)
 req := &protocol.ProduceRequest{
-    Topic:   "orders",
-    Payload: []byte(`{"user": 123}`),
+    Topic:     "orders",
+    Partition: -1,                    // -1 = use key hash
+    Key:       []byte("user-123"),    // for partitioning
+    Payload:   []byte(`{"item": "widget"}`),
 }
 data := protocol.EncodeProduceRequest(req)
 decoded, err := protocol.DecodeProduceRequest(data)
 
-// Encode/decode fetch requests
+// Encode/decode fetch requests (from specific partition)
 fetchReq := &protocol.FetchRequest{
-    Topic:    "orders",
-    Offset:   0,
-    MaxBytes: 65536,
+    Topic:     "orders",
+    Partition: 0,       // which partition to read
+    Offset:    0,
+    MaxBytes:  65536,
 }
 data := protocol.EncodeFetchRequest(fetchReq)
 decoded, err := protocol.DecodeFetchRequest(data)
@@ -252,18 +270,19 @@ decoded, err := protocol.DecodeFetchResponse(data)
 ```go
 // Create and start a broker
 config := broker.BrokerConfig{
-    Port:    9092,
-    DataDir: "./data",  // topics stored as subdirectories
+    Port:          9092,
+    DataDir:       "./data",  // topics stored as subdirectories
+    NumPartitions: 3,         // default partitions for new topics
 }
 b := broker.NewBroker(config)
 
-// Start accepting connections
+// Start accepting connections (loads existing topics from disk)
 if err := b.Start(); err != nil {
     log.Fatal(err)
 }
 
-// Broker auto-creates logs for new topics
-// Data stored in: ./data/{topic}/00000000000000000000.log
+// Broker auto-creates topics with partitions
+// Data stored in: ./data/{topic}/partition-{N}/00000000000000000000.log
 
 // Graceful shutdown
 b.Stop()  // closes connections, flushes logs
@@ -276,11 +295,20 @@ b.Stop()  // closes connections, flushes logs
 producer, _ := client.NewProducer("localhost:9092")
 defer producer.Close()
 
-offset, err := producer.Produce("orders", []byte(`{"user": 123}`))
-// offset is the assigned position in the log
+// Simple produce (no key, goes to partition 0)
+result, err := producer.Produce("orders", []byte(`{"item": "widget"}`))
+// result.Partition = 0, result.Offset = assigned offset
 
-// Consumer - fetch messages from broker
-consumer, _ := client.NewConsumer("localhost:9092", "orders", 0)
+// Produce with key (same key = same partition)
+result, err = producer.ProduceWithKey("orders", []byte("user-123"), []byte(`{"item": "gadget"}`))
+// result.Partition = hash("user-123") % numPartitions
+
+// Produce to specific partition
+result, err = producer.ProduceToPartition("orders", 2, nil, []byte(`{"item": "thing"}`))
+// result.Partition = 2
+
+// Consumer - fetch messages from a specific partition
+consumer, _ := client.NewConsumer("localhost:9092", "orders", 0, 0) // partition 0, offset 0
 defer consumer.Close()
 
 messages, err := consumer.Fetch(65536)  // max 64KB of messages
@@ -288,9 +316,67 @@ for _, msg := range messages {
     fmt.Printf("Offset %d: %s\n", msg.Offset, msg.Payload)
 }
 
-// Consumer tracks offset automatically
-// Next Fetch() continues from where previous left off
+// Consumer tracks offset automatically within the partition
 nextOffset := consumer.Offset()
+partition := consumer.Partition()
+```
+
+### Partitioner (pkg/client)
+
+```go
+// Partitioner interface for custom routing strategies
+type Partitioner interface {
+    Partition(key []byte, numPartitions int) int
+}
+
+// HashPartitioner - FNV-1a hash (default)
+// Same key always maps to same partition
+partitioner := &client.HashPartitioner{}
+partition := partitioner.Partition([]byte("user-123"), 3)  // deterministic
+
+// RoundRobinPartitioner - even distribution, no ordering
+partitioner := &client.RoundRobinPartitioner{}
+partition := partitioner.Partition(nil, 3)  // 0, 1, 2, 0, 1, 2, ...
+```
+
+### Topic Manager (internal/topic)
+
+```go
+// TopicConfig configures topic creation
+config := topic.TopicConfig{
+    NumPartitions: 3,
+    LogConfig:     storage.LogConfig{...},
+}
+
+// Manager handles topic lifecycle
+manager := topic.NewManager("./data", config)
+
+// Load existing topics from disk on startup
+err := manager.LoadExisting()
+
+// Get or create a topic (lazy creation)
+t, err := manager.GetOrCreate("orders")
+
+// Get existing topic (returns nil if not found)
+t := manager.Get("orders")
+
+// List all topics
+names := manager.Topics()  // []string{"orders", "users", ...}
+
+// Topic operations
+numPartitions := t.NumPartitions()
+offset, err := t.Append(partitionID, record)
+record, err := t.Read(partitionID, offset)
+
+// Partition operations
+p, err := t.Partition(0)
+offset, err := p.Append(record)
+record, err := p.Read(offset)
+oldest := p.OldestOffset()
+newest := p.NewestOffset()
+
+// Cleanup
+manager.Close()
 ```
 
 ## Benchmarks
@@ -321,10 +407,10 @@ Benchmarks will be added after Phase 6.
 Request:  [Size:4][APIKey:2][RequestID:4][Payload:var]
 Response: [Size:4][RequestID:4][Payload:var]
 
-ProduceRequest:  [TopicLen:2][Topic:var][PayloadLen:4][Payload:var]
-ProduceResponse: [Offset:8][ErrorCode:2]
+ProduceRequest:  [TopicLen:2][Topic:var][Partition:4][KeyLen:4][Key:var][PayloadLen:4][Payload:var]
+ProduceResponse: [Partition:4][Offset:8][ErrorCode:2]
 
-FetchRequest:    [TopicLen:2][Topic:var][Offset:8][MaxBytes:4]
+FetchRequest:    [TopicLen:2][Topic:var][Partition:4][Offset:8][MaxBytes:4]
 FetchResponse:   [ErrorCode:2][RecordCount:4][Records:var]
   Each record:   [Offset:8][PayloadLen:4][Payload:var]
 ```
@@ -338,8 +424,17 @@ FetchResponse:   [ErrorCode:2][RecordCount:4][Records:var]
 ### Client Libraries
 - **Synchronous API**: One request/response at a time per connection (no pipelining yet)
 - **Atomic request IDs**: Incrementing counter for request correlation
-- **Consumer offset tracking**: Client tracks position; advances after each Fetch
+- **Consumer offset tracking**: Client tracks position within partition; advances after each Fetch
 - **No batching**: Producer sends one message per request (batching planned for Phase 5)
+
+### Topics + Partitions
+- **Partition = independent log**: Each partition is a separate Log instance in its own directory
+- **Directory structure**: `data/{topic}/partition-{N}/` isolates partition data
+- **Key-based routing**: FNV-1a hash of key determines partition; same key = same partition = ordering preserved
+- **Lazy topic creation**: Topics created on first produce; partition count fixed at creation
+- **Recovery**: Manager scans data directory on startup, counts partition-N directories to determine partition count
+- **RWMutex for manager**: Read lock for topic lookup; write lock only when creating new topics
+- **Partition in protocol**: Both produce and fetch specify partition; -1 means use key hash
 
 ## What I Learned
 
