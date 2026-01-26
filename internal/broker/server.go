@@ -7,36 +7,49 @@ import (
 	"sync"
 
 	"github.com/G1DO/flume/internal/protocol"
-	"github.com/G1DO/flume/internal/storage"
+	"github.com/G1DO/flume/internal/topic"
 )
 
 // BrokerConfig holds broker configuration.
 type BrokerConfig struct {
-	Port    int
-	DataDir string
+	Port          int
+	DataDir       string
+	NumPartitions int // default partitions for new topics
 }
 
 // Broker is the main server that handles client connections.
 type Broker struct {
 	config   BrokerConfig
 	listener net.Listener
-	logs     map[string]*storage.Log // topic name → log
-	logsMu   sync.RWMutex            // protects logs map
-	wg       sync.WaitGroup          // tracks active connections
-	quit     chan struct{}           // signals shutdown
+	topics   *topic.Manager
+	wg       sync.WaitGroup  // tracks active connections
+	quit     chan struct{}   // signals shutdown
 }
 
 // NewBroker creates a new broker instance.
 func NewBroker(config BrokerConfig) *Broker {
+	if config.NumPartitions <= 0 {
+		config.NumPartitions = 3 // default
+	}
+
+	topicConfig := topic.TopicConfig{
+		NumPartitions: config.NumPartitions,
+	}
+
 	return &Broker{
 		config: config,
-		logs:   make(map[string]*storage.Log),
+		topics: topic.NewManager(config.DataDir, topicConfig),
 		quit:   make(chan struct{}),
 	}
 }
 
 // Start begins listening for connections.
 func (b *Broker) Start() error {
+	// Load existing topics from disk
+	if err := b.topics.LoadExisting(); err != nil {
+		return fmt.Errorf("failed to load topics: %w", err)
+	}
+
 	addr := fmt.Sprintf(":%d", b.config.Port)
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -110,39 +123,10 @@ func (b *Broker) handleConnection(conn net.Conn) {
 	}
 }
 
-// getOrCreateLog gets or creates a log for the topic.
-func (b *Broker) getOrCreateLog(topic string) (*storage.Log, error) {
-	b.logsMu.RLock()
-	log, exists := b.logs[topic]
-	b.logsMu.RUnlock()
-	if exists {
-		return log, nil
-	}
-
-	b.logsMu.Lock()
-	defer b.logsMu.Unlock()
-
-	if log, exists := b.logs[topic]; exists {
-		return log, nil
-	}
-
-	dir := fmt.Sprintf("%s/%s", b.config.DataDir, topic)
-	log, err := storage.NewLog(dir, storage.LogConfig{})
-	if err != nil {
-		return nil, err
-	}
-	if err := log.Recover(); err != nil {
-		log.Close()
-		return nil, err
-	}
-
-	b.logs[topic] = log
-	return log, nil
-}
-
 // errorResponse creates an error response.
 func (b *Broker) errorResponse(requestID int32, errorCode int16) []byte {
 	resp := protocol.EncodeProduceResponse(&protocol.ProduceResponse{
+		Partition: -1,
 		Offset:    -1,
 		ErrorCode: errorCode,
 	})
@@ -160,13 +144,7 @@ func (b *Broker) Stop() error {
 		b.listener.Close()
 	}
 	b.wg.Wait()
-
-	b.logsMu.Lock()
-	defer b.logsMu.Unlock()
-	for _, log := range b.logs {
-		log.Close()
-	}
-	return nil
+	return b.topics.Close()
 }
 
 // Addr returns the listener address.

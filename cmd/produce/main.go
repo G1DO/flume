@@ -11,6 +11,7 @@ import (
 func main() {
 	broker := flag.String("broker", "localhost:9092", "Broker address")
 	topic := flag.String("topic", "", "Topic to produce to")
+	key := flag.String("key", "", "Message key (for partitioning)")
 	message := flag.String("message", "", "Message to send")
 	flag.Parse()
 
@@ -30,11 +31,17 @@ func main() {
 	}
 	defer producer.Close()
 
-	offset, err := producer.Produce(*topic, []byte(*message))
+	var result *client.ProduceResult
+	if *key != "" {
+		result, err = producer.ProduceWithKey(*topic, []byte(*key), []byte(*message))
+	} else {
+		result, err = producer.Produce(*topic, []byte(*message))
+	}
+
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to produce: %v\n", err)
 		os.Exit(1)
 	}
 
-	fmt.Printf("Produced to %s at offset %d\n", *topic, offset)
+	fmt.Printf("Produced to %s partition %d at offset %d\n", *topic, result.Partition, result.Offset)
 }
