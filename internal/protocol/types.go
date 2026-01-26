@@ -36,25 +36,29 @@ type ResponseHeader struct {
 }
 
 // ProduceRequest is sent by producers to store a message.
-// Wire format: [TopicLen:2][Topic:var][PayloadLen:4][Payload:var]
+// Wire format: [TopicLen:2][Topic:var][Partition:4][KeyLen:4][Key:var][PayloadLen:4][Payload:var]
 type ProduceRequest struct {
-	Topic   string // which topic to write to
-	Payload []byte // the message data
+	Topic     string // which topic to write to
+	Partition int32  // partition to write to (-1 = use key hash)
+	Key       []byte // message key (for partitioning)
+	Payload   []byte // the message data
 }
 
 // ProduceResponse is returned after a produce request.
-// Wire format: [Offset:8][ErrorCode:2]
+// Wire format: [Partition:4][Offset:8][ErrorCode:2]
 type ProduceResponse struct {
+	Partition int32 // partition written to
 	Offset    int64 // assigned offset (-1 if error)
 	ErrorCode int16 // 0 = success
 }
 
 // FetchRequest is sent by consumers to read messages.
-// Wire format: [TopicLen:2][Topic:var][Offset:8][MaxBytes:4]
+// Wire format: [TopicLen:2][Topic:var][Partition:4][Offset:8][MaxBytes:4]
 type FetchRequest struct {
-	Topic    string // which topic to read from
-	Offset   int64  // starting offset
-	MaxBytes int32  // max bytes to return (0 = no limit)
+	Topic     string // which topic to read from
+	Partition int32  // which partition to read from
+	Offset    int64  // starting offset
+	MaxBytes  int32  // max bytes to return (0 = no limit)
 }
 
 // FetchResponse is returned with fetched messages.

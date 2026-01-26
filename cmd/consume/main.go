@@ -11,6 +11,7 @@ import (
 func main() {
 	broker := flag.String("broker", "localhost:9092", "Broker address")
 	topic := flag.String("topic", "", "Topic to consume from")
+	partition := flag.Int("partition", 0, "Partition to consume from")
 	offset := flag.Int64("offset", 0, "Starting offset")
 	maxBytes := flag.Int("max-bytes", 65536, "Max bytes to fetch")
 	flag.Parse()
@@ -20,7 +21,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	consumer, err := client.NewConsumer(*broker, *topic, *offset)
+	consumer, err := client.NewConsumer(*broker, *topic, int32(*partition), *offset)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to connect: %v\n", err)
 		os.Exit(1)

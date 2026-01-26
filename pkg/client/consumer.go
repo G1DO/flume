@@ -15,24 +15,26 @@ type Message struct {
 	Payload []byte
 }
 
-// Consumer fetches messages from a broker.
+// Consumer fetches messages from a broker partition.
 type Consumer struct {
 	conn      net.Conn
 	topic     string
+	partition int32
 	offset    int64
 	requestID int32
 }
 
-// NewConsumer connects to a broker and returns a consumer for the topic.
-func NewConsumer(addr, topic string, startOffset int64) (*Consumer, error) {
+// NewConsumer connects to a broker and returns a consumer for the topic partition.
+func NewConsumer(addr, topic string, partition int32, startOffset int64) (*Consumer, error) {
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect: %w", err)
 	}
 	return &Consumer{
-		conn:   conn,
-		topic:  topic,
-		offset: startOffset,
+		conn:      conn,
+		topic:     topic,
+		partition: partition,
+		offset:    startOffset,
 	}, nil
 }
 
@@ -43,9 +45,10 @@ func (c *Consumer) Fetch(maxBytes int32) ([]Message, error) {
 
 	// Build request
 	req := &protocol.FetchRequest{
-		Topic:    c.topic,
-		Offset:   c.offset,
-		MaxBytes: maxBytes,
+		Topic:     c.topic,
+		Partition: c.partition,
+		Offset:    c.offset,
+		MaxBytes:  maxBytes,
 	}
 	reqBytes := protocol.EncodeFetchRequest(req)
 
@@ -106,6 +109,11 @@ func (c *Consumer) Fetch(maxBytes int32) ([]Message, error) {
 // Offset returns the current offset.
 func (c *Consumer) Offset() int64 {
 	return c.offset
+}
+
+// Partition returns the partition being consumed.
+func (c *Consumer) Partition() int32 {
+	return c.partition
 }
 
 // Close closes the connection to the broker.

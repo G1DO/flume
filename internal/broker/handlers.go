@@ -1,6 +1,8 @@
 package broker
 
 import (
+	"hash/fnv"
+
 	"github.com/G1DO/flume/internal/protocol"
 	"github.com/G1DO/flume/internal/storage"
 )
@@ -11,28 +13,51 @@ func (b *Broker) handleProduce(requestID int32, payload []byte) []byte {
 	// Decode request
 	req, err := protocol.DecodeProduceRequest(payload)
 	if err != nil {
-		return b.produceResponse(requestID, -1, protocol.ErrUnknown)
+		return b.produceResponse(requestID, -1, -1, protocol.ErrUnknown)
 	}
 
-	// Get or create log for topic
-	log, err := b.getOrCreateLog(req.Topic)
+	// Get or create topic
+	t, err := b.topics.GetOrCreate(req.Topic)
 	if err != nil {
-		return b.produceResponse(requestID, -1, protocol.ErrUnknown)
+		return b.produceResponse(requestID, -1, -1, protocol.ErrUnknown)
 	}
 
-	// Create record and append
+	// Determine partition
+	partition := req.Partition
+	if partition < 0 {
+		// Use key hash to determine partition
+		partition = hashPartition(req.Key, t.NumPartitions())
+	}
+
+	// Validate partition
+	if int(partition) >= t.NumPartitions() {
+		return b.produceResponse(requestID, partition, -1, protocol.ErrUnknown)
+	}
+
+	// Create record and append to partition
 	record := storage.NewRecord(req.Payload)
-	offset, err := log.Append(record)
+	offset, err := t.Append(int(partition), record)
 	if err != nil {
-		return b.produceResponse(requestID, -1, protocol.ErrUnknown)
+		return b.produceResponse(requestID, partition, -1, protocol.ErrUnknown)
 	}
 
-	return b.produceResponse(requestID, offset, protocol.ErrNone)
+	return b.produceResponse(requestID, partition, offset, protocol.ErrNone)
+}
+
+// hashPartition computes partition from key using FNV-1a hash.
+func hashPartition(key []byte, numPartitions int) int32 {
+	if len(key) == 0 || numPartitions <= 0 {
+		return 0
+	}
+	h := fnv.New32a()
+	h.Write(key)
+	return int32(h.Sum32() % uint32(numPartitions))
 }
 
 // produceResponse builds a PRODUCE response.
-func (b *Broker) produceResponse(requestID int32, offset int64, errorCode int16) []byte {
+func (b *Broker) produceResponse(requestID int32, partition int32, offset int64, errorCode int16) []byte {
 	resp := protocol.EncodeProduceResponse(&protocol.ProduceResponse{
+		Partition: partition,
 		Offset:    offset,
 		ErrorCode: errorCode,
 	})
@@ -52,12 +77,16 @@ func (b *Broker) handleFetch(requestID int32, payload []byte) []byte {
 		return b.fetchResponse(requestID, protocol.ErrUnknown, nil)
 	}
 
-	// Get log for topic
-	b.logsMu.RLock()
-	log, exists := b.logs[req.Topic]
-	b.logsMu.RUnlock()
-	if !exists {
+	// Get topic
+	t := b.topics.Get(req.Topic)
+	if t == nil {
 		return b.fetchResponse(requestID, protocol.ErrTopicNotFound, nil)
+	}
+
+	// Get partition
+	p, err := t.Partition(int(req.Partition))
+	if err != nil {
+		return b.fetchResponse(requestID, protocol.ErrUnknown, nil)
 	}
 
 	// Read records starting from offset
@@ -72,7 +101,7 @@ func (b *Broker) handleFetch(requestID int32, payload []byte) []byte {
 		}
 
 		// Try to read next record
-		record, err := log.Read(offset)
+		record, err := p.Read(offset)
 		if err != nil {
 			break // No more records or error
 		}
@@ -88,7 +117,7 @@ func (b *Broker) handleFetch(requestID int32, payload []byte) []byte {
 	}
 
 	// If no records and offset is out of range, return error
-	if len(records) == 0 && req.Offset >= log.NewestOffset() {
+	if len(records) == 0 && req.Offset >= p.NewestOffset() {
 		return b.fetchResponse(requestID, protocol.ErrOffsetOutOfRange, nil)
 	}
 
