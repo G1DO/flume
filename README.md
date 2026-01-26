@@ -4,30 +4,16 @@ A message streaming system built from scratch in Go. Not a Kafka wrapper — the
 
 ## Status
 
-**In Development** — Phase 2 (Broker + Wire Protocol)
+**In Development** — Phase 3 (Topics + Partitions)
 
 | Phase | Description | Status |
 |-------|-------------|--------|
 | 1 | Log Storage Engine | Complete |
-| 2 | Broker + Wire Protocol | In Progress |
+| 2 | Broker + Wire Protocol | Complete |
 | 3 | Topics + Partitions | Not started |
 | 4 | Consumer Groups | Not started |
 | 5 | Backpressure | Not started |
 | 6 | Integration + Benchmarks | Not started |
-
-### Phase 2 Progress
-
-| Milestone | Status |
-|-----------|--------|
-| Wire protocol types (Request/Response headers) | Done |
-| ProduceRequest/ProduceResponse encoding | Done |
-| FetchRequest/FetchResponse encoding | Done |
-| Error codes | Done |
-| TCP server | Not started |
-| PRODUCE handler | Not started |
-| FETCH handler | Not started |
-| Producer client | Not started |
-| Consumer client | Not started |
 
 ## What This Is
 
@@ -79,9 +65,12 @@ Producers --> Broker --> Consumers
 ```
 flume/
 ├── cmd/
-│   ├── broker/           # (planned) Main broker binary
-│   ├── produce/          # (planned) CLI producer
-│   └── consume/          # (planned) CLI consumer
+│   ├── broker/           # Main broker binary (--port, --data flags)
+│   │   └── main.go
+│   ├── produce/          # CLI producer (--broker, --topic, --message)
+│   │   └── main.go
+│   └── consume/          # CLI consumer (--broker, --topic, --offset, --max-bytes)
+│       └── main.go
 ├── internal/
 │   ├── storage/          # Phase 1: Log engine
 │   │   ├── record.go     # Record struct, encode/decode, CRC, stream reading
@@ -90,15 +79,20 @@ flume/
 │   │   ├── log.go        # Multi-segment log abstraction
 │   │   ├── errors.go     # Storage error types
 │   │   └── *_test.go     # Unit tests
-│   ├── protocol/         # Phase 2: Wire protocol (in progress)
+│   ├── protocol/         # Phase 2: Wire protocol
 │   │   ├── types.go      # Request/response structs, API keys, error codes
 │   │   ├── encode.go     # Binary encode/decode for all message types
 │   │   └── *_test.go     # Round-trip and edge case tests
-│   ├── broker/           # (planned) TCP server
+│   ├── broker/           # Phase 2: TCP server
+│   │   ├── server.go     # TCP listener, connection handling, topic log management
+│   │   ├── handlers.go   # PRODUCE and FETCH request handlers
+│   │   └── *_test.go     # Integration tests
 │   ├── topic/            # (planned) Topics + partitions
 │   └── consumer/         # (planned) Consumer groups
 ├── pkg/
-│   └── client/           # (planned) Producer/consumer libraries
+│   └── client/           # Phase 2: Client libraries
+│       ├── producer.go   # Producer with connection pooling
+│       └── consumer.go   # Consumer with offset tracking
 ├── test/
 │   └── integration/      # (planned) End-to-end tests
 └── docs/
@@ -110,9 +104,41 @@ flume/
 ```bash
 # Run tests
 go test ./...
+
+# Start the broker (default port 9092, data in ./data)
+go run ./cmd/broker --port 9092 --data ./data
+
+# Produce a message
+go run ./cmd/produce --broker localhost:9092 --topic test --message "hello world"
+
+# Consume messages from offset 0
+go run ./cmd/consume --broker localhost:9092 --topic test --offset 0
+
+# Build all binaries
+go build ./cmd/broker
+go build ./cmd/produce
+go build ./cmd/consume
 ```
 
-CLI tools not yet implemented — see BUILD_PLAN.md for roadmap.
+### Example Session
+
+```bash
+# Terminal 1: Start broker
+./broker --port 9092 &
+
+# Terminal 2: Produce messages
+./produce --topic orders --message '{"user": 123, "item": "widget"}'
+# Output: Produced to orders at offset 0
+
+./produce --topic orders --message '{"user": 456, "item": "gadget"}'
+# Output: Produced to orders at offset 1
+
+# Terminal 3: Consume messages
+./consume --topic orders --offset 0
+# Output:
+# [0] {"user": 123, "item": "widget"}
+# [1] {"user": 456, "item": "gadget"}
+```
 
 ## Current API (internal/storage)
 
@@ -221,6 +247,52 @@ data := protocol.EncodeFetchResponse(resp)
 decoded, err := protocol.DecodeFetchResponse(data)
 ```
 
+### Broker (internal/broker)
+
+```go
+// Create and start a broker
+config := broker.BrokerConfig{
+    Port:    9092,
+    DataDir: "./data",  // topics stored as subdirectories
+}
+b := broker.NewBroker(config)
+
+// Start accepting connections
+if err := b.Start(); err != nil {
+    log.Fatal(err)
+}
+
+// Broker auto-creates logs for new topics
+// Data stored in: ./data/{topic}/00000000000000000000.log
+
+// Graceful shutdown
+b.Stop()  // closes connections, flushes logs
+```
+
+### Client (pkg/client)
+
+```go
+// Producer - send messages to broker
+producer, _ := client.NewProducer("localhost:9092")
+defer producer.Close()
+
+offset, err := producer.Produce("orders", []byte(`{"user": 123}`))
+// offset is the assigned position in the log
+
+// Consumer - fetch messages from broker
+consumer, _ := client.NewConsumer("localhost:9092", "orders", 0)
+defer consumer.Close()
+
+messages, err := consumer.Fetch(65536)  // max 64KB of messages
+for _, msg := range messages {
+    fmt.Printf("Offset %d: %s\n", msg.Offset, msg.Payload)
+}
+
+// Consumer tracks offset automatically
+// Next Fetch() continues from where previous left off
+nextOffset := consumer.Offset()
+```
+
 ## Benchmarks
 
 Benchmarks will be added after Phase 6.
@@ -256,6 +328,18 @@ FetchRequest:    [TopicLen:2][Topic:var][Offset:8][MaxBytes:4]
 FetchResponse:   [ErrorCode:2][RecordCount:4][Records:var]
   Each record:   [Offset:8][PayloadLen:4][Payload:var]
 ```
+
+### Broker
+- **One goroutine per connection**: Simple concurrency model; connection loop reads requests sequentially
+- **Lazy topic creation**: Logs created on first produce to topic (no explicit CREATE_TOPIC API)
+- **RWMutex for topic map**: Allows concurrent reads to different topics; write lock only for new topic creation
+- **Graceful shutdown**: WaitGroup tracks active connections; quit channel signals shutdown
+
+### Client Libraries
+- **Synchronous API**: One request/response at a time per connection (no pipelining yet)
+- **Atomic request IDs**: Incrementing counter for request correlation
+- **Consumer offset tracking**: Client tracks position; advances after each Fetch
+- **No batching**: Producer sends one message per request (batching planned for Phase 5)
 
 ## What I Learned
 
