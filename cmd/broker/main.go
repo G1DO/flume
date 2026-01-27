@@ -15,10 +15,14 @@ func main() {
 	dataDir := flag.String("data", "./data", "Data directory")
 	flag.Parse()
 
-	b := broker.NewBroker(broker.BrokerConfig{
+	b, err := broker.NewBroker(broker.BrokerConfig{
 		Port:    *port,
 		DataDir: *dataDir,
 	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create broker: %v\n", err)
+		os.Exit(1)
+	}
 
 	if err := b.Start(); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to start broker: %v\n", err)

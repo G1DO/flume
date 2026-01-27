@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"path/filepath"
 	"sync"
 
+	"github.com/G1DO/flume/internal/consumer"
 	"github.com/G1DO/flume/internal/protocol"
 	"github.com/G1DO/flume/internal/topic"
 )
@@ -19,15 +21,17 @@ type BrokerConfig struct {
 
 // Broker is the main server that handles client connections.
 type Broker struct {
-	config   BrokerConfig
-	listener net.Listener
-	topics   *topic.Manager
-	wg       sync.WaitGroup  // tracks active connections
-	quit     chan struct{}   // signals shutdown
+	config      BrokerConfig
+	listener    net.Listener
+	topics      *topic.Manager
+	coordinator *consumer.Coordinator
+	offsets     *consumer.OffsetStore
+	wg          sync.WaitGroup // tracks active connections
+	quit        chan struct{}  // signals shutdown
 }
 
 // NewBroker creates a new broker instance.
-func NewBroker(config BrokerConfig) *Broker {
+func NewBroker(config BrokerConfig) (*Broker, error) {
 	if config.NumPartitions <= 0 {
 		config.NumPartitions = 3 // default
 	}
@@ -36,11 +40,39 @@ func NewBroker(config BrokerConfig) *Broker {
 		NumPartitions: config.NumPartitions,
 	}
 
-	return &Broker{
-		config: config,
-		topics: topic.NewManager(config.DataDir, topicConfig),
-		quit:   make(chan struct{}),
+	topics := topic.NewManager(config.DataDir, topicConfig)
+
+	// Create offset store for consumer groups
+	offsetDir := filepath.Join(config.DataDir, "__consumer_offsets")
+	offsets, err := consumer.NewOffsetStore(offsetDir)
+	if err != nil {
+		return nil, fmt.Errorf("create offset store: %w", err)
 	}
+
+	// Create coordinator with topic manager as partition info source
+	coordConfig := consumer.DefaultCoordinatorConfig()
+	coordinator := consumer.NewCoordinator(coordConfig, offsets, &topicPartitionInfo{topics})
+
+	return &Broker{
+		config:      config,
+		topics:      topics,
+		coordinator: coordinator,
+		offsets:     offsets,
+		quit:        make(chan struct{}),
+	}, nil
+}
+
+// topicPartitionInfo adapts topic.Manager to consumer.TopicInfo interface.
+type topicPartitionInfo struct {
+	manager *topic.Manager
+}
+
+func (t *topicPartitionInfo) GetPartitionCount(topicName string) (int, bool) {
+	top := t.manager.Get(topicName)
+	if top == nil {
+		return 0, false
+	}
+	return top.NumPartitions(), true
 }
 
 // Start begins listening for connections.
@@ -49,6 +81,9 @@ func (b *Broker) Start() error {
 	if err := b.topics.LoadExisting(); err != nil {
 		return fmt.Errorf("failed to load topics: %w", err)
 	}
+
+	// Start the coordinator for consumer group management
+	b.coordinator.Start()
 
 	addr := fmt.Sprintf(":%d", b.config.Port)
 	listener, err := net.Listen("tcp", addr)
@@ -113,6 +148,16 @@ func (b *Broker) handleConnection(conn net.Conn) {
 			response = b.handleProduce(header.RequestID, payload)
 		case protocol.APIKeyFetch:
 			response = b.handleFetch(header.RequestID, payload)
+		case protocol.APIKeyJoinGroup:
+			response = b.handleJoinGroup(header.RequestID, payload)
+		case protocol.APIKeyLeaveGroup:
+			response = b.handleLeaveGroup(header.RequestID, payload)
+		case protocol.APIKeyHeartbeat:
+			response = b.handleHeartbeat(header.RequestID, payload)
+		case protocol.APIKeyOffsetCommit:
+			response = b.handleOffsetCommit(header.RequestID, payload)
+		case protocol.APIKeyOffsetFetch:
+			response = b.handleOffsetFetch(header.RequestID, payload)
 		default:
 			response = b.errorResponse(header.RequestID, protocol.ErrUnknown)
 		}
@@ -144,6 +189,7 @@ func (b *Broker) Stop() error {
 		b.listener.Close()
 	}
 	b.wg.Wait()
+	b.coordinator.Stop()
 	return b.topics.Close()
 }
 

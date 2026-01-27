@@ -4,14 +4,14 @@ A message streaming system built from scratch in Go. Not a Kafka wrapper — the
 
 ## Status
 
-**In Development** — Phase 4 (Consumer Groups)
+**In Development** — Phase 5 (Backpressure)
 
 | Phase | Description | Status |
 |-------|-------------|--------|
 | 1 | Log Storage Engine | Complete |
 | 2 | Broker + Wire Protocol | Complete |
 | 3 | Topics + Partitions | Complete |
-| 4 | Consumer Groups | Not started |
+| 4 | Consumer Groups | Complete |
 | 5 | Backpressure | Not started |
 | 6 | Integration + Benchmarks | Not started |
 
@@ -79,9 +79,10 @@ flume/
 │   │   ├── log.go        # Multi-segment log abstraction
 │   │   ├── errors.go     # Storage error types
 │   │   └── *_test.go     # Unit tests
-│   ├── protocol/         # Phase 2: Wire protocol
+│   ├── protocol/         # Phase 2-4: Wire protocol
 │   │   ├── types.go      # Request/response structs, API keys, error codes
-│   │   ├── encode.go     # Binary encode/decode for all message types
+│   │   ├── encode.go     # Binary encode/decode for produce/fetch
+│   │   ├── consumer_group.go # Encode/decode for consumer group messages
 │   │   └── *_test.go     # Round-trip and edge case tests
 │   ├── broker/           # Phase 2: TCP server
 │   │   ├── server.go     # TCP listener, connection handling, topic log management
@@ -91,7 +92,11 @@ flume/
 │   │   ├── partition.go  # Partition wrapping Log
 │   │   ├── topic.go      # Topic with multiple partitions
 │   │   └── manager.go    # Topic registry with lazy creation
-│   └── consumer/         # (planned) Consumer groups
+│   └── consumer/         # Phase 4: Consumer groups
+│       ├── group.go      # Group membership, state, heartbeat tracking
+│       ├── coordinator.go # Group coordinator with partition assignment
+│       ├── offset.go     # Persistent offset storage
+│       └── *_test.go     # Unit tests
 ├── pkg/
 │   └── client/           # Client libraries
 │       ├── producer.go   # Producer with key-based partitioning
@@ -212,8 +217,13 @@ err := segment.Close()
 ```go
 // API keys identify the operation
 const (
-    APIKeyProduce int16 = 0
-    APIKeyFetch   int16 = 1
+    APIKeyProduce      int16 = 0
+    APIKeyFetch        int16 = 1
+    APIKeyJoinGroup    int16 = 2
+    APIKeyLeaveGroup   int16 = 3
+    APIKeyHeartbeat    int16 = 4
+    APIKeyOffsetCommit int16 = 5
+    APIKeyOffsetFetch  int16 = 6
 )
 
 // Error codes
@@ -222,6 +232,9 @@ const (
     ErrUnknown          int16 = 1
     ErrTopicNotFound    int16 = 2
     ErrOffsetOutOfRange int16 = 3
+    ErrUnknownMember    int16 = 4
+    ErrStaleGeneration  int16 = 5
+    ErrRebalanceNeeded  int16 = 6
 )
 
 // Encode/decode request headers
@@ -379,6 +392,108 @@ newest := p.NewestOffset()
 manager.Close()
 ```
 
+### Consumer Groups (internal/consumer)
+
+```go
+// OffsetStore - persists committed offsets to disk
+offsetStore, _ := consumer.NewOffsetStore("./data/offsets")
+offsetStore.Commit("analytics", "orders", 0, 42)  // group, topic, partition, offset
+offset := offsetStore.Fetch("analytics", "orders", 0)  // returns -1 if not committed
+offsetStore.Close()
+
+// Group - manages membership and assignments
+group := consumer.NewGroup("analytics")
+memberID, generation := group.Join("")  // empty string = generate new ID
+group.Heartbeat(memberID, generation)   // returns error if stale generation
+group.Leave(memberID)                   // triggers rebalance
+group.ExpireMembers(10 * time.Second)   // remove members without recent heartbeat
+
+// Get member info
+member, ok := group.GetMember(memberID)
+// member.ID, member.State, member.LastHeartbeat, member.Assignments
+
+// Assign partitions to members
+group.AssignPartitions(memberID, []consumer.Assignment{
+    {Topic: "orders", Partition: 0},
+    {Topic: "orders", Partition: 1},
+})
+
+// Coordinator - manages all groups, runs heartbeat loop
+config := consumer.DefaultCoordinatorConfig()  // 10s session timeout, 1s heartbeat interval
+coordinator := consumer.NewCoordinator(config, offsetStore, topicManager)
+coordinator.Start()  // begins background heartbeat checking
+defer coordinator.Stop()
+
+// Join a group (creates group if not exists)
+result, _ := coordinator.JoinGroup("analytics", "", []string{"orders"})
+// result.MemberID, result.Generation, result.LeaderID, result.Members
+
+// Get assignments for a member
+assignments, _ := coordinator.GetAssignments("analytics", memberID)
+
+// Commit/fetch offsets through coordinator
+coordinator.CommitOffset("analytics", "orders", 0, 100)
+offset := coordinator.FetchOffset("analytics", "orders", 0)
+
+// Leave group
+coordinator.LeaveGroup("analytics", memberID)
+```
+
+### Consumer Group Protocol (internal/protocol)
+
+```go
+// JoinGroupRequest/Response - join a consumer group
+req := &protocol.JoinGroupRequest{
+    GroupID:        "analytics",
+    MemberID:       "",              // empty for new member
+    SessionTimeout: 10000,           // milliseconds
+    Topics:         []string{"orders", "events"},
+}
+data := protocol.EncodeJoinGroupRequest(req)
+decoded, _ := protocol.DecodeJoinGroupRequest(data)
+
+resp := &protocol.JoinGroupResponse{
+    ErrorCode:  protocol.ErrNone,
+    Generation: 1,
+    LeaderID:   "member-abc",
+    MemberID:   "member-xyz",
+    Members:    []string{"member-abc", "member-xyz"},
+}
+data = protocol.EncodeJoinGroupResponse(resp)
+
+// LeaveGroupRequest/Response - leave a consumer group
+leaveReq := &protocol.LeaveGroupRequest{GroupID: "analytics", MemberID: "member-xyz"}
+leaveResp := &protocol.LeaveGroupResponse{ErrorCode: protocol.ErrNone}
+
+// HeartbeatRequest/Response - keep membership alive
+hbReq := &protocol.HeartbeatRequest{
+    GroupID:    "analytics",
+    Generation: 1,
+    MemberID:   "member-xyz",
+}
+hbResp := &protocol.HeartbeatResponse{ErrorCode: protocol.ErrNone}  // or ErrRebalanceNeeded
+
+// OffsetCommitRequest/Response - commit consumed offset
+commitReq := &protocol.OffsetCommitRequest{
+    GroupID:   "analytics",
+    Topic:     "orders",
+    Partition: 0,
+    Offset:    42,
+}
+commitResp := &protocol.OffsetCommitResponse{ErrorCode: protocol.ErrNone}
+
+// OffsetFetchRequest/Response - fetch committed offset
+fetchReq := &protocol.OffsetFetchRequest{
+    GroupID:   "analytics",
+    Topic:     "orders",
+    Partition: 0,
+}
+fetchResp := &protocol.OffsetFetchResponse{
+    ErrorCode: protocol.ErrNone,
+    Offset:    42,  // -1 if no committed offset
+}
+```
+
 ## Benchmarks
 
 Benchmarks will be added after Phase 6.
@@ -435,6 +550,33 @@ FetchResponse:   [ErrorCode:2][RecordCount:4][Records:var]
 - **Recovery**: Manager scans data directory on startup, counts partition-N directories to determine partition count
 - **RWMutex for manager**: Read lock for topic lookup; write lock only when creating new topics
 - **Partition in protocol**: Both produce and fetch specify partition; -1 means use key hash
+
+### Consumer Groups
+- **Generation tracking**: Each rebalance increments generation; stale generations rejected to prevent split-brain
+- **Leader election**: First member alphabetically becomes leader (deterministic for debugging)
+- **Range assignment**: Partitions divided evenly among members; remainder distributed to first N members
+- **Heartbeat-based liveness**: Members must heartbeat within session timeout or get expelled
+- **Offset persistence**: Committed offsets stored per group/topic/partition, persisted atomically via temp file + rename
+- **Coordinator pattern**: Central coordinator manages all groups, runs background heartbeat expiration loop
+
+```
+Consumer Group Wire Protocol:
+
+JoinGroupRequest:   [GroupLen:2][Group:var][MemberIDLen:2][MemberID:var][SessionTimeout:4][TopicCount:2][Topics:var]
+JoinGroupResponse:  [ErrorCode:2][Generation:4][LeaderLen:2][Leader:var][MemberIDLen:2][MemberID:var][MemberCount:2][Members:var]
+
+LeaveGroupRequest:  [GroupLen:2][Group:var][MemberIDLen:2][MemberID:var]
+LeaveGroupResponse: [ErrorCode:2]
+
+HeartbeatRequest:   [GroupLen:2][Group:var][Generation:4][MemberIDLen:2][MemberID:var]
+HeartbeatResponse:  [ErrorCode:2]
+
+OffsetCommitRequest:  [GroupLen:2][Group:var][TopicLen:2][Topic:var][Partition:4][Offset:8]
+OffsetCommitResponse: [ErrorCode:2]
+
+OffsetFetchRequest:   [GroupLen:2][Group:var][TopicLen:2][Topic:var][Partition:4]
+OffsetFetchResponse:  [ErrorCode:2][Offset:8]
+```
 
 ## What I Learned
 

@@ -136,3 +136,124 @@ func (b *Broker) fetchResponse(requestID int32, errorCode int16, records []proto
 	})
 	return append(header, resp...)
 }
+
+// --- Consumer Group Handlers ---
+
+// handleJoinGroup processes a JOIN_GROUP request.
+func (b *Broker) handleJoinGroup(requestID int32, payload []byte) []byte {
+	req, err := protocol.DecodeJoinGroupRequest(payload)
+	if err != nil {
+		return b.joinGroupResponse(requestID, protocol.ErrUnknown, 0, "", "", nil)
+	}
+
+	result, err := b.coordinator.JoinGroup(req.GroupID, req.MemberID, req.Topics)
+	if err != nil {
+		return b.joinGroupResponse(requestID, protocol.ErrUnknown, 0, "", "", nil)
+	}
+
+	// Assign partitions for the topics
+	group, _ := b.coordinator.GetGroup(req.GroupID)
+	if group != nil {
+		b.coordinator.AssignTopicPartitions(group, req.Topics)
+	}
+
+	return b.joinGroupResponse(requestID, protocol.ErrNone, result.Generation, result.LeaderID, result.MemberID, result.Members)
+}
+
+func (b *Broker) joinGroupResponse(requestID int32, errorCode int16, generation int32, leaderID, memberID string, members []string) []byte {
+	resp := protocol.EncodeJoinGroupResponse(&protocol.JoinGroupResponse{
+		ErrorCode:  errorCode,
+		Generation: generation,
+		LeaderID:   leaderID,
+		MemberID:   memberID,
+		Members:    members,
+	})
+	header := protocol.EncodeResponseHeader(&protocol.ResponseHeader{
+		Size:      int32(4 + len(resp)),
+		RequestID: requestID,
+	})
+	return append(header, resp...)
+}
+
+// handleLeaveGroup processes a LEAVE_GROUP request.
+func (b *Broker) handleLeaveGroup(requestID int32, payload []byte) []byte {
+	req, err := protocol.DecodeLeaveGroupRequest(payload)
+	if err != nil {
+		return b.simpleErrorResponse(requestID, protocol.ErrUnknown)
+	}
+
+	if err := b.coordinator.LeaveGroup(req.GroupID, req.MemberID); err != nil {
+		return b.simpleErrorResponse(requestID, protocol.ErrUnknown)
+	}
+
+	return b.simpleErrorResponse(requestID, protocol.ErrNone)
+}
+
+// handleHeartbeat processes a HEARTBEAT request.
+func (b *Broker) handleHeartbeat(requestID int32, payload []byte) []byte {
+	req, err := protocol.DecodeHeartbeatRequest(payload)
+	if err != nil {
+		return b.simpleErrorResponse(requestID, protocol.ErrUnknown)
+	}
+
+	if err := b.coordinator.Heartbeat(req.GroupID, req.MemberID, req.Generation); err != nil {
+		if err.Error() == "stale generation" {
+			return b.simpleErrorResponse(requestID, protocol.ErrStaleGeneration)
+		}
+		if err.Error() == "unknown member" {
+			return b.simpleErrorResponse(requestID, protocol.ErrUnknownMember)
+		}
+		return b.simpleErrorResponse(requestID, protocol.ErrUnknown)
+	}
+
+	return b.simpleErrorResponse(requestID, protocol.ErrNone)
+}
+
+// handleOffsetCommit processes an OFFSET_COMMIT request.
+func (b *Broker) handleOffsetCommit(requestID int32, payload []byte) []byte {
+	req, err := protocol.DecodeOffsetCommitRequest(payload)
+	if err != nil {
+		return b.simpleErrorResponse(requestID, protocol.ErrUnknown)
+	}
+
+	if err := b.coordinator.CommitOffset(req.GroupID, req.Topic, req.Partition, req.Offset); err != nil {
+		return b.simpleErrorResponse(requestID, protocol.ErrUnknown)
+	}
+
+	return b.simpleErrorResponse(requestID, protocol.ErrNone)
+}
+
+// handleOffsetFetch processes an OFFSET_FETCH request.
+func (b *Broker) handleOffsetFetch(requestID int32, payload []byte) []byte {
+	req, err := protocol.DecodeOffsetFetchRequest(payload)
+	if err != nil {
+		return b.offsetFetchResponse(requestID, protocol.ErrUnknown, -1)
+	}
+
+	offset := b.coordinator.FetchOffset(req.GroupID, req.Topic, req.Partition)
+	return b.offsetFetchResponse(requestID, protocol.ErrNone, offset)
+}
+
+func (b *Broker) offsetFetchResponse(requestID int32, errorCode int16, offset int64) []byte {
+	resp := protocol.EncodeOffsetFetchResponse(&protocol.OffsetFetchResponse{
+		ErrorCode: errorCode,
+		Offset:    offset,
+	})
+	header := protocol.EncodeResponseHeader(&protocol.ResponseHeader{
+		Size:      int32(4 + len(resp)),
+		RequestID: requestID,
+	})
+	return append(header, resp...)
+}
+
+// simpleErrorResponse builds a response with just an error code (2 bytes).
+func (b *Broker) simpleErrorResponse(requestID int32, errorCode int16) []byte {
+	resp := make([]byte, 2)
+	resp[0] = byte(errorCode >> 8)
+	resp[1] = byte(errorCode)
+	header := protocol.EncodeResponseHeader(&protocol.ResponseHeader{
+		Size:      int32(4 + len(resp)),
+		RequestID: requestID,
+	})
+	return append(header, resp...)
+}

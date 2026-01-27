@@ -11,7 +11,10 @@ import (
 
 func TestBrokerStartStop(t *testing.T) {
 	dir := t.TempDir()
-	b := NewBroker(BrokerConfig{Port: 0, DataDir: dir})
+	b, err := NewBroker(BrokerConfig{Port: 0, DataDir: dir})
+	if err != nil {
+		t.Fatalf("NewBroker failed: %v", err)
+	}
 
 	if err := b.Start(); err != nil {
 		t.Fatalf("Start failed: %v", err)
@@ -28,7 +31,10 @@ func TestBrokerStartStop(t *testing.T) {
 
 func TestBrokerProduce(t *testing.T) {
 	dir := t.TempDir()
-	b := NewBroker(BrokerConfig{Port: 0, DataDir: dir})
+	b, err := NewBroker(BrokerConfig{Port: 0, DataDir: dir})
+	if err != nil {
+		t.Fatalf("NewBroker failed: %v", err)
+	}
 	if err := b.Start(); err != nil {
 		t.Fatalf("Start failed: %v", err)
 	}
@@ -91,7 +97,10 @@ func TestBrokerProduce(t *testing.T) {
 
 func TestBrokerProduceThenFetch(t *testing.T) {
 	dir := t.TempDir()
-	b := NewBroker(BrokerConfig{Port: 0, DataDir: dir})
+	b, err := NewBroker(BrokerConfig{Port: 0, DataDir: dir})
+	if err != nil {
+		t.Fatalf("NewBroker failed: %v", err)
+	}
 	if err := b.Start(); err != nil {
 		t.Fatalf("Start failed: %v", err)
 	}
@@ -155,7 +164,10 @@ func TestBrokerProduceThenFetch(t *testing.T) {
 
 func TestBrokerFetchTopicNotFound(t *testing.T) {
 	dir := t.TempDir()
-	b := NewBroker(BrokerConfig{Port: 0, DataDir: dir})
+	b, err := NewBroker(BrokerConfig{Port: 0, DataDir: dir})
+	if err != nil {
+		t.Fatalf("NewBroker failed: %v", err)
+	}
 	if err := b.Start(); err != nil {
 		t.Fatalf("Start failed: %v", err)
 	}
