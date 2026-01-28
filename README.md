@@ -4,7 +4,7 @@ A message streaming system built from scratch in Go. Not a Kafka wrapper — the
 
 ## Status
 
-**In Development** — Phase 5 (Backpressure)
+**In Development** — Phase 6 (Integration + Benchmarks)
 
 | Phase | Description | Status |
 |-------|-------------|--------|
@@ -12,7 +12,7 @@ A message streaming system built from scratch in Go. Not a Kafka wrapper — the
 | 2 | Broker + Wire Protocol | Complete |
 | 3 | Topics + Partitions | Complete |
 | 4 | Consumer Groups | Complete |
-| 5 | Backpressure | Not started |
+| 5 | Backpressure | Complete |
 | 6 | Integration + Benchmarks | Not started |
 
 ## What This Is
@@ -88,10 +88,11 @@ flume/
 │   │   ├── server.go     # TCP listener, connection handling, topic log management
 │   │   ├── handlers.go   # PRODUCE and FETCH request handlers
 │   │   └── *_test.go     # Integration tests
-│   ├── topic/            # Phase 3: Topics + partitions
-│   │   ├── partition.go  # Partition wrapping Log
+│   ├── topic/            # Phase 3+5: Topics + partitions + backpressure
+│   │   ├── partition.go  # Partition with bounded write buffer
 │   │   ├── topic.go      # Topic with multiple partitions
-│   │   └── manager.go    # Topic registry with lazy creation
+│   │   ├── manager.go    # Topic registry with lazy creation
+│   │   └── *_test.go     # Backpressure and concurrency tests
 │   └── consumer/         # Phase 4: Consumer groups
 │       ├── group.go      # Group membership, state, heartbeat tracking
 │       ├── coordinator.go # Group coordinator with partition assignment
@@ -550,6 +551,14 @@ FetchResponse:   [ErrorCode:2][RecordCount:4][Records:var]
 - **Recovery**: Manager scans data directory on startup, counts partition-N directories to determine partition count
 - **RWMutex for manager**: Read lock for topic lookup; write lock only when creating new topics
 - **Partition in protocol**: Both produce and fetch specify partition; -1 means use key hash
+
+### Backpressure
+- **Bounded write buffer**: Each partition has a buffered channel (`make(chan writeRequest, N)`) that limits pending writes
+- **Per-partition channels**: Slow partition doesn't block other partitions (preserves parallelism)
+- **Background write goroutine**: One goroutine per partition drains the channel and appends to disk
+- **Synchronous response**: Producer blocks until write completes, getting back offset (no fire-and-forget)
+- **Graceful shutdown**: Close signals quit, drains remaining buffered writes, then closes log
+- **Configurable buffer size**: `BufferSize` in config (default 1024 per partition)
 
 ### Consumer Groups
 - **Generation tracking**: Each rebalance increments generation; stale generations rejected to prevent split-brain
