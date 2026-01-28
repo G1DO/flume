@@ -18,6 +18,7 @@ type Topic struct {
 type TopicConfig struct {
 	NumPartitions int
 	LogConfig     storage.LogConfig
+	BufferSize    int // per-partition write buffer size (0 = default)
 }
 
 // NewTopic creates a new topic with the specified number of partitions.
@@ -34,9 +35,9 @@ func NewTopic(dataDir, name string, config TopicConfig) (*Topic, error) {
 		dir:        topicDir,
 	}
 
-	// Create all partitions
+	// Create all partitions with bounded write buffers
 	for i := 0; i < config.NumPartitions; i++ {
-		p, err := NewPartition(topicDir, i, config.LogConfig)
+		p, err := NewPartitionWithBuffer(topicDir, i, config.LogConfig, config.BufferSize)
 		if err != nil {
 			// Close already created partitions
 			for j := 0; j < i; j++ {
