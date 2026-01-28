@@ -17,6 +17,7 @@ type BrokerConfig struct {
 	Port          int
 	DataDir       string
 	NumPartitions int // default partitions for new topics
+	BufferSize    int // per-partition write buffer size (0 = default 1024)
 }
 
 // Broker is the main server that handles client connections.
@@ -38,6 +39,7 @@ func NewBroker(config BrokerConfig) (*Broker, error) {
 
 	topicConfig := topic.TopicConfig{
 		NumPartitions: config.NumPartitions,
+		BufferSize:    config.BufferSize,
 	}
 
 	topics := topic.NewManager(config.DataDir, topicConfig)
