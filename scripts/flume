@@ -1,0 +1,224 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DEFAULT_BROKER="localhost:9092"
+DEFAULT_PORT="9092"
+DEFAULT_DATA_DIR="$ROOT_DIR/data"
+DEFAULT_TOPIC="orders"
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  scripts/flume broker [--port PORT] [--data DIR]
+  scripts/flume produce [--topic TOPIC] [--key KEY] --message MESSAGE
+  scripts/flume consume [--topic TOPIC] [--partition N] [--offset N]
+  scripts/flume demo
+  scripts/flume test
+
+Examples:
+  scripts/flume broker
+  scripts/flume produce --topic orders --key user-123 --message '{"item":"widget"}'
+  scripts/flume consume --topic orders --partition 0 --offset 0
+  scripts/flume demo
+USAGE
+}
+
+run_go() {
+  (cd "$ROOT_DIR" && go run "$@")
+}
+
+broker() {
+  local port="$DEFAULT_PORT"
+  local data_dir="$DEFAULT_DATA_DIR"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --port)
+        port="${2:?Missing value for --port}"
+        shift 2
+        ;;
+      --data)
+        data_dir="${2:?Missing value for --data}"
+        shift 2
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        echo "Unknown broker option: $1" >&2
+        usage
+        exit 1
+        ;;
+    esac
+  done
+
+  run_go ./cmd/broker --port "$port" --data "$data_dir"
+}
+
+produce() {
+  local topic="$DEFAULT_TOPIC"
+  local key=""
+  local message=""
+  local broker_addr="$DEFAULT_BROKER"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --broker)
+        broker_addr="${2:?Missing value for --broker}"
+        shift 2
+        ;;
+      --topic)
+        topic="${2:?Missing value for --topic}"
+        shift 2
+        ;;
+      --key)
+        key="${2:?Missing value for --key}"
+        shift 2
+        ;;
+      --message)
+        message="${2:?Missing value for --message}"
+        shift 2
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        echo "Unknown produce option: $1" >&2
+        usage
+        exit 1
+        ;;
+    esac
+  done
+
+  if [[ -z "$message" ]]; then
+    echo "Missing required option: --message" >&2
+    usage
+    exit 1
+  fi
+
+  if [[ -n "$key" ]]; then
+    run_go ./cmd/produce --broker "$broker_addr" --topic "$topic" --key "$key" --message "$message"
+  else
+    run_go ./cmd/produce --broker "$broker_addr" --topic "$topic" --message "$message"
+  fi
+}
+
+consume() {
+  local topic="$DEFAULT_TOPIC"
+  local partition="0"
+  local offset="0"
+  local broker_addr="$DEFAULT_BROKER"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --broker)
+        broker_addr="${2:?Missing value for --broker}"
+        shift 2
+        ;;
+      --topic)
+        topic="${2:?Missing value for --topic}"
+        shift 2
+        ;;
+      --partition)
+        partition="${2:?Missing value for --partition}"
+        shift 2
+        ;;
+      --offset)
+        offset="${2:?Missing value for --offset}"
+        shift 2
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        echo "Unknown consume option: $1" >&2
+        usage
+        exit 1
+        ;;
+    esac
+  done
+
+  run_go ./cmd/consume --broker "$broker_addr" --topic "$topic" --partition "$partition" --offset "$offset"
+}
+
+demo() {
+  DEMO_DATA_DIR="$(mktemp -d)"
+  DEMO_BROKER_LOG="$DEMO_DATA_DIR/broker.log"
+
+  cleanup() {
+    if [[ -n "${DEMO_BROKER_PID:-}" ]] && kill -0 "$DEMO_BROKER_PID" 2>/dev/null; then
+      kill "$DEMO_BROKER_PID" 2>/dev/null || true
+      wait "$DEMO_BROKER_PID" 2>/dev/null || true
+    fi
+    rm -rf "${DEMO_DATA_DIR:-}"
+  }
+  trap cleanup EXIT
+
+  echo "Starting broker on $DEFAULT_BROKER..."
+  (cd "$ROOT_DIR" && go run ./cmd/broker --port "$DEFAULT_PORT" --data "$DEMO_DATA_DIR" >"$DEMO_BROKER_LOG" 2>&1) &
+  DEMO_BROKER_PID=$!
+
+  for _ in {1..30}; do
+    if grep -q "Broker listening" "$DEMO_BROKER_LOG"; then
+      break
+    fi
+    if ! kill -0 "$DEMO_BROKER_PID" 2>/dev/null; then
+      echo "Broker failed to start:" >&2
+      cat "$DEMO_BROKER_LOG" >&2
+      exit 1
+    fi
+    sleep 0.2
+  done
+
+  echo "Producing messages..."
+  local produced
+  produced="$(produce --topic "$DEFAULT_TOPIC" --key user-123 --message '{"item":"widget"}')"
+  echo "$produced"
+  produce --topic "$DEFAULT_TOPIC" --key user-123 --message '{"item":"gadget"}'
+
+  local partition
+  partition="$(sed -n 's/.* partition \([0-9][0-9]*\) at offset .*/\1/p' <<<"$produced")"
+  if [[ -z "$partition" ]]; then
+    echo "Could not determine produced partition from: $produced" >&2
+    exit 1
+  fi
+
+  echo
+  echo "Consuming partition $partition from offset 0..."
+  consume --topic "$DEFAULT_TOPIC" --partition "$partition" --offset 0
+}
+
+case "${1:-}" in
+  broker)
+    shift
+    broker "$@"
+    ;;
+  produce)
+    shift
+    produce "$@"
+    ;;
+  consume)
+    shift
+    consume "$@"
+    ;;
+  demo)
+    shift
+    demo "$@"
+    ;;
+  test)
+    shift
+    (cd "$ROOT_DIR" && go test ./...)
+    ;;
+  -h|--help|"")
+    usage
+    ;;
+  *)
+    echo "Unknown command: $1" >&2
+    usage
+    exit 1
+    ;;
+esac
